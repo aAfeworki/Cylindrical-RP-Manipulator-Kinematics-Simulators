@@ -1,0 +1,160 @@
+import numpy as np
+import tkinter as tk
+from tkinter import filedialog, messagebox
+import pandas as pd
+import matplotlib
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+from mpl_toolkits.mplot3d import Axes3D  
+
+# ====== Drum / Robot Parameters ======
+R = 3.0                     # drum radius (fixed)
+C = 2.0 * np.pi * R         # circumference (arc-length)
+L_y = 10.0                  # vertical workspace
+L_x = C                     # workspace width in unwrapped coords
+
+# ====== Inverse Kinematics ======
+def ik(x, y):
+    q1 = y
+    q2 = x
+    return q1, q2
+
+# ====== Interpolation helper ======
+def append_interpolated_marks(x_marks, y_marks, s_from, y_from, s_to, y_to, Rval):
+    ds = s_to - s_from
+    dy = y_to - y_from
+    step_s = max(Rval * 0.005, C / 2000.0)
+    step_y = max(0.01, L_y / 1000.0)
+    n_s = int(np.ceil(abs(ds)/step_s)) if step_s>0 else 0
+    n_y = int(np.ceil(abs(dy)/step_y)) if step_y>0 else 0
+    n_steps = max(1, n_s, n_y)
+    for k in range(1,n_steps+1):
+        alpha = k / float(n_steps)
+        s_i = s_from + alpha*ds
+        y_i = y_from + alpha*dy
+        x_local = (-s_i) % C
+        x_marks.append(x_local)
+        y_marks.append(y_i)
+
+# ====== Map local marks -> world coords ======
+def marks_local_to_world(x_local_list, y_local_list, Rval, s_current):
+    if len(x_local_list)==0:
+        return np.array([]), np.array([]), np.array([])
+    x_arr = np.array(x_local_list)
+    y_arr = np.array(y_local_list)
+    theta_local = x_arr / Rval
+    phi = s_current / Rval
+    theta_world = theta_local + phi
+    X = Rval * np.cos(theta_world)
+    Z = Rval * np.sin(theta_world)
+    Y = y_arr
+    return X, Y, Z
+
+# ====== Run IK and simulate ======
+def run_ik():
+    try:
+        x_expr = x_entry.get()
+        y_expr = y_entry.get()
+        t_end = float(t_entry.get())
+        steps = int(steps_entry.get())
+
+        t = np.linspace(0, t_end, steps)
+        x_vals = [eval(x_expr, {"t": val, "np": np}) for val in t]
+        y_vals = [eval(y_expr, {"t": val, "np": np}) for val in t]
+
+        q1s, q2s = [], []
+        for x, y in zip(x_vals, y_vals):
+            q1, q2 = ik(x, y)
+            q1s.append(float(q1))
+            q2s.append(float(q2))
+
+        data = {"time": t, "q1 (vert)": q1s, "q2 (arc-length)": q2s}
+        df = pd.DataFrame(data)
+        file_path = filedialog.asksaveasfilename(defaultextension=".csv",
+                                                 filetypes=[("CSV files","*.csv")])
+        if file_path:
+            df.to_csv(file_path, index=False)
+            messagebox.showinfo("Success", f"File saved as {file_path}")
+
+        simulate(t, q1s, q2s)
+
+    except Exception as e:
+        messagebox.showerror("Error", str(e))
+
+# ====== Simulator ======
+def simulate(times, q1s, q2s):
+    x_local_marks, y_local_marks = [], []
+    prev_s, prev_y = q2s[0], q1s[0]
+
+    fig = plt.figure(figsize=(10,5))
+    ax_flat = fig.add_subplot(1,2,1)
+    ax_cyl = fig.add_subplot(1,2,2, projection='3d')
+    fig.subplots_adjust(left=0.06, right=0.98, top=0.94, bottom=0.08)
+
+    # Flat workspace
+    ax_flat.set_title("Flat Workspace (unwrapped)")
+    ax_flat.set_xlim(0,L_x); ax_flat.set_ylim(0,L_y)
+    ax_flat.set_xlabel("x (arc-length)"); ax_flat.set_ylabel("y (vertical)")
+    ax_flat.set_aspect("equal")
+    ax_flat.plot([0,L_x,L_x,0,0],[0,0,L_y,L_y,0],'k-',lw=2)
+    flat_trace_line, = ax_flat.plot([],[],'r-',lw=2)
+    flat_pen_dot, = ax_flat.plot([],[],'ro',markersize=6)
+
+    # Cylinder view
+    ax_cyl.set_title("Cylindrical View (drum)")
+    ax_cyl.set_xlabel("X"); ax_cyl.set_ylabel("Y (vertical)"); ax_cyl.set_zlabel("Z")
+    ax_cyl.set_ylim(0,L_y); ax_cyl.set_xlim(-R-1,R+1); ax_cyl.set_zlim(-R-1,R+1)
+    ax_cyl.view_init(elev=18, azim=-60)
+    theta_grid = np.linspace(0,2*np.pi,120)
+    y_grid = np.linspace(0,L_y,24)
+    TH, YW = np.meshgrid(theta_grid,y_grid)
+    XW = R*np.cos(TH); ZW = R*np.sin(TH)
+    ax_cyl.plot_wireframe(XW,YW,ZW,rstride=2,cstride=4,linewidth=0.5,color='gray',alpha=0.45)
+    ax_cyl.plot([0,0],[0,L_y],[0,0],'k-',lw=2)
+    pen_world_artist, = ax_cyl.plot([R],[prev_y],[0],'ro',markersize=7)
+    cyl_trace_artist, = ax_cyl.plot([],[],[],'r-',lw=2)
+
+    # Animation update
+    def update(i):
+        nonlocal prev_s, prev_y
+        q1 = q1s[i]; q2 = q2s[i]
+        append_interpolated_marks(x_local_marks,y_local_marks,prev_s,prev_y,q2,q1,R)
+        prev_s, prev_y = q2,q1
+        X,Y,Z = marks_local_to_world(x_local_marks,y_local_marks,R,q2)
+        cyl_trace_artist.set_data(X,Y); cyl_trace_artist.set_3d_properties(Z)
+        flat_trace_line.set_data(x_local_marks,y_local_marks)
+        x_contact = (-q2)%C
+        flat_pen_dot.set_data([x_contact],[q1])
+        pen_world_artist.set_data([R],[q1]); pen_world_artist.set_3d_properties([0])
+        return flat_trace_line, flat_pen_dot, cyl_trace_artist, pen_world_artist
+
+    interval_ms = max(20,int(np.mean(np.diff(times))*1000)) if len(times)>=2 else 200
+    ani = animation.FuncAnimation(fig, update, frames=len(q1s), interval=interval_ms,
+                                  blit=False, repeat=False, cache_frame_data=False)
+    plt.show()
+
+# ====== Tkinter GUI ======
+root = tk.Tk()
+root.title("Drum Plotter (IK)")
+
+tk.Label(root, text="x(t) function (arc-length on drum):").grid(row=0,column=0,sticky="w")
+x_entry = tk.Entry(root,width=48); x_entry.insert(0,"5 + 5*np.cos(0.6*t)*np.cos(t)")
+x_entry.grid(row=0,column=1,padx=4,pady=2)
+
+tk.Label(root, text="y(t) function (vertical):").grid(row=1,column=0,sticky="w")
+y_entry = tk.Entry(root,width=48); y_entry.insert(0,"5 + 5*np.cos(0.6*t)*np.sin(t)")
+y_entry.grid(row=1,column=1,padx=4,pady=2)
+
+tk.Label(root,text="Simulation time (t_end):").grid(row=2,column=0,sticky="w")
+t_entry = tk.Entry(root,width=20); t_entry.insert(0,"15.8")
+t_entry.grid(row=2,column=1,sticky="w",padx=4,pady=2)
+
+tk.Label(root,text="Steps:").grid(row=3,column=0,sticky="w")
+steps_entry = tk.Entry(root,width=20); steps_entry.insert(0,"200")
+steps_entry.grid(row=3,column=1,sticky="w",padx=4,pady=2)
+
+run_btn = tk.Button(root,text="Generate IK + Simulate", command=run_ik)
+run_btn.grid(row=4,column=0,columnspan=2,pady=8)
+
+root.mainloop()

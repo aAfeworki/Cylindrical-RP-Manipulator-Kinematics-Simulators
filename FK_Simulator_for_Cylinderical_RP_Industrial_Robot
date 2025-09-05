@@ -1,0 +1,334 @@
+import numpy as np
+import matplotlib
+matplotlib.use("TkAgg")  # embed matplotlib in Tkinter
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import matplotlib.animation as animation
+import tkinter as tk
+from tkinter import scrolledtext, messagebox
+from mpl_toolkits.mplot3d import Axes3D  
+
+# ====== Drum parameters ======
+R = 3.0                          # drum radius (fixed)
+C = 2.0 * np.pi * R              # circumference (arc-length space)
+Y_MAX = 10.0                     # vertical workspace (same as PP's vertical range)
+
+# ====== Forward kinematics for drum (FK) ======
+def fk_drum(y, s, Rval):
+    """
+    y: vertical position (same as q1 in PP)
+    s: drum rotation expressed as arc-length (same role as q2 in PP but wraps)
+    Rval: drum radius
+    Returns world (X, Y, Z) coords for the point at drum front angle (used to position pen).
+    """
+    theta = s / Rval
+    x_cyl = Rval * np.cos(theta)
+    z_cyl = Rval * np.sin(theta)
+    y_cyl = y
+    return (x_cyl, y_cyl, z_cyl)
+
+# ====== Storage for marks (paper-local coordinates) ======
+# marks are stored in unwrapped coordinates (x_local in [0,C), y_local in [0,Y_MAX]).
+x_local_marks = []   # arc-length positions on the paper where a mark exists (unwrapped)
+y_local_marks = []   # corresponding vertical positions
+
+# ====== Animation / Playback state (match the PP app variables) ======
+ani = None
+is_paused = False
+frame_index = 0
+times = []
+q1_list = []   # vertical positions (y)
+q2_list = []   # drum arc-length rotation (s)
+# previous frame slider positions (used for interpolation)
+prev_s = None
+prev_y = None
+
+# ====== Interpolation helper (to avoid shortcuts) ======
+def append_interpolated_marks(s_from, y_from, s_to, y_to, Rval):
+    """
+    Append many small intermediate marks between (s_from, y_from) and (s_to, y_to).
+    This ensures the trace follows the cylindrical surface rather than cutting across.
+    I convert intermediate s_i into paper-local x_local = (-s_i) % C
+    """
+    global x_local_marks, y_local_marks
+    ds = s_to - s_from
+    dy = y_to - y_from
+
+    # choose step sizes:
+    target_step_arc = max(Rval * 0.005, C / 2000.0)  # smaller => smoother
+    target_step_y = max(0.01, Y_MAX / 1000.0)
+    n_s = int(np.ceil(abs(ds) / target_step_arc)) if target_step_arc > 0 else 0
+    n_y = int(np.ceil(abs(dy) / target_step_y)) if target_step_y > 0 else 0
+    n_steps = max(1, n_s, n_y)
+
+    # create intermediate points (exclude starting point to avoid duplicates)
+    for k in range(1, n_steps + 1):
+        alpha = k / float(n_steps)
+        s_i = s_from + alpha * ds
+        y_i = y_from + alpha * dy
+        x_local = (-s_i) % C
+        x_local_marks.append(x_local)
+        y_local_marks.append(y_i)
+
+# ====== Mapping local marks -> world (X,Y,Z) given current drum rotation s_current ======
+def marks_local_to_world(x_local_list, y_local_list, Rval, s_current):
+    if len(x_local_list) == 0:
+        return np.array([]), np.array([]), np.array([])
+    x_arr = np.array(x_local_list)
+    y_arr = np.array(y_local_list)
+    theta_local = x_arr / Rval
+    phi = s_current / Rval
+    theta_world = theta_local + phi
+    X = Rval * np.cos(theta_world)
+    Z = Rval * np.sin(theta_world)
+    Y = y_arr
+    return X, Y, Z
+
+# ====== Build Tkinter GUI + Matplotlib canvas (keeps layout similar to PP FK app) ======
+root = tk.Tk()
+root.title("Drum Plotter - Forward Kinematics Simulator (PP-style GUI)")
+
+main_frame = tk.Frame(root)
+main_frame.pack(fill="both", expand=True)
+
+# Left: text box for pasted trajectory (t,q1,q2)
+text_box = scrolledtext.ScrolledText(main_frame, width=30, height=20, wrap=tk.WORD)
+text_box.pack(side="left", fill="y", padx=5, pady=5)
+example_text = "0, 2, 1\n0.5, 4, 2.5\n1.0, 6, 5\n1.5, 7, 8\n2.0, 5, 12"
+text_box.insert(tk.END, example_text)
+
+# Right: Matplotlib figure inside Tkinter
+fig = plt.figure(figsize=(7,6))
+# create two subplots: left=flat unwrapped, right=3D cylinder
+ax_flat = fig.add_subplot(1,2,1)
+ax_cyl  = fig.add_subplot(1,2,2, projection='3d')
+fig.subplots_adjust(left=0.05, right=0.98, top=0.93, bottom=0.07)
+
+# Flat workspace settings (rectangular outline)
+ax_flat.set_title("Flat Workspace (unwrapped)")
+ax_flat.set_xlabel("x (arc-length)")
+ax_flat.set_ylabel("y (vertical)")
+ax_flat.set_xlim(0, C)
+ax_flat.set_ylim(0, Y_MAX)
+ax_flat.set_aspect("equal")
+ax_flat.plot([0, C, C, 0, 0], [0, 0, Y_MAX, Y_MAX, 0], 'k-', lw=2)  # workspace rectangle
+
+# artists for flat view
+flat_trace_artist, = ax_flat.plot([], [], 'r-', lw=2)
+flat_pen_dot, = ax_flat.plot([], [], 'ro', markersize=6)
+flat_info = ax_flat.text(0.02, 0.95, '', transform=ax_flat.transAxes, va="top",
+                         bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.7))
+
+# Cylinder view setup
+ax_cyl.set_title("Cylindrical View (drum)")
+ax_cyl.set_xlabel("X")
+ax_cyl.set_ylabel("Y (vertical)")
+ax_cyl.set_zlabel("Z")
+ax_cyl.set_ylim(0, Y_MAX)
+ax_cyl.set_xlim(-R - 1.0, R + 1.0)
+ax_cyl.set_zlim(-R - 1.0, R + 1.0)
+ax_cyl.view_init(elev=18, azim=-60)
+
+# cylinder wireframe for context
+theta_grid = np.linspace(0, 2*np.pi, 120)
+y_grid = np.linspace(0, Y_MAX, 24)
+TH, YW = np.meshgrid(theta_grid, y_grid)
+XW = R * np.cos(TH)
+ZW = R * np.sin(TH)
+ax_cyl.plot_wireframe(XW, YW, ZW, rstride=2, cstride=4, linewidth=0.5, color='gray', alpha=0.45)
+ax_cyl.plot([0,0], [0, Y_MAX], [0,0], 'k-', lw=2)  # center axis reference
+
+# pen (stationary in world coords at front: X=R, Z=0)
+pen_world_artist, = ax_cyl.plot([R], [0], [0], 'ro', markersize=7)  # y will be updated each frame
+# cylinder trace artist
+cyl_trace_artist, = ax_cyl.plot([], [], [], 'r-', lw=2)
+cyl_info = ax_cyl.text2D(0.03, 0.95, '', transform=ax_cyl.transAxes, va="top",
+                         bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.7))
+
+# Matplotlib canvas into Tkinter
+canvas = FigureCanvasTkAgg(fig, master=main_frame)
+canvas.get_tk_widget().pack(side="right", fill="both", expand=True)
+
+# ====== Control buttons (like your PP GUI) ======
+button_frame = tk.Frame(root)
+button_frame.pack(pady=6)
+
+def run_trajectory():
+    """Parse the text box for (t,q1,q2) and start the animation."""
+    global times, q1_list, q2_list, ani, frame_index, x_local_marks, y_local_marks
+    global prev_s, prev_y, is_paused
+
+    raw_text = text_box.get("1.0", tk.END).strip()
+    if not raw_text:
+        messagebox.showwarning("Warning", "No data pasted!")
+        return
+
+    # parse lines "t, q1, q2"
+    lines = raw_text.splitlines()
+    times_temp, q1_temp, q2_temp = [], [], []
+    for line in lines:
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) >= 3:
+            try:
+                t = float(parts[0])
+                q1 = float(parts[1])
+                q2 = float(parts[2])
+                times_temp.append(t)
+                q1_temp.append(q1)
+                q2_temp.append(q2)
+            except ValueError:
+                continue
+
+    if not q1_temp:
+        messagebox.showerror("Error", "Invalid data format! Expected lines: t,q1,q2")
+        return
+
+    # assign globals
+    times = times_temp
+    q1_list = q1_temp
+    q2_list = q2_temp
+
+    # reset drawing state
+    x_local_marks = []
+    y_local_marks = []
+    frame_index = 0
+    is_paused = False
+    pause_btn.config(text="Pause")
+
+    # prev positions for interpolation (use initial frame as previous)
+    prev_s = q2_list[0]
+    prev_y = q1_list[0]
+
+    # stop any existing animation safely
+    global ani
+    if ani:
+        try:
+            ani.event_source.stop()
+        except Exception:
+            pass
+        ani = None
+
+    # determine interval (ms) from times if possible
+    if len(times) >= 2:
+        dt = np.mean(np.diff(times))
+        interval_ms = max(20, int(dt * 1000.0))  # at least 20 ms
+    else:
+        interval_ms = 200
+
+    # create FuncAnimation (do NOT use blit for 3D)
+    ani = animation.FuncAnimation(fig, animate, frames=len(q1_list), interval=interval_ms,
+                                  blit=False, repeat=False, cache_frame_data=False)
+    canvas.draw()
+
+def animate(i):
+    """Animation update for frame i. We follow PP's animate style but adapted for drum behavior."""
+    global frame_index, prev_s, prev_y, x_local_marks, y_local_marks, ani
+
+    # if paused we rely on the event_source being stopped; but keep check as fallback:
+    if is_paused:
+        return flat_trace_artist, flat_pen_dot, flat_info, cyl_trace_artist, pen_world_artist, cyl_info
+
+    if frame_index >= len(q1_list):
+        # reached end: ensure animation stops cleanly
+        if ani:
+            try:
+                ani.event_source.stop()
+            except Exception:
+                pass
+        return flat_trace_artist, flat_pen_dot, flat_info, cyl_trace_artist, pen_world_artist, cyl_info
+
+    # current frame commanded positions
+    q1 = q1_list[frame_index]   # vertical
+    q2 = q2_list[frame_index]   # drum rotation arc-length s
+
+    # append small interpolation marks between prev and current to avoid shortcuts
+    append_interpolated_marks(prev_s, prev_y, q2, q1, R)
+
+    # update prev for next frame
+    prev_s = q2
+    prev_y = q1
+
+    # compute world positions of all stored local marks using current rotation s_current = q2
+    X, Y, Z = marks_local_to_world(x_local_marks, y_local_marks, R, q2)
+
+    # update cylinder artist
+    if X.size > 0:
+        cyl_trace_artist.set_data(X, Y)
+        cyl_trace_artist.set_3d_properties(Z)
+    else:
+        cyl_trace_artist.set_data([], [])
+        cyl_trace_artist.set_3d_properties([])
+
+    # update flat artist (unwrapped paper) - show full trace and dot at contact point
+    if len(x_local_marks) > 0:
+        flat_trace_artist.set_data(x_local_marks, y_local_marks)
+    else:
+        flat_trace_artist.set_data([], [])
+    # contact position on paper under the pen:
+    x_contact = (-q2) % C
+    flat_pen_dot.set_data([x_contact], [q1])
+
+    # update pen world (fixed at front X=R, Z=0) and its Y
+    pen_world_artist.set_data([R], [q1])
+    pen_world_artist.set_3d_properties([0])
+
+    # info boxes
+    flat_info.set_text(f"t = {times[frame_index]:.3f}\n x (arc) = {x_contact:.3f}\n y = {q1:.3f}")
+    theta_local = x_contact / R
+    cyl_info.set_text(f"t = {times[frame_index]:.3f}\n s (rotation) = {q2:.3f}\n θ_local = {theta_local:.3f} rad")
+
+    # highlight current line in the text box (same behavior as PP code)
+    text_box.tag_remove("highlight", "1.0", tk.END)
+    line_number = f"{frame_index+1}.0"
+    text_box.tag_add("highlight", line_number, f"{line_number} lineend")
+    text_box.tag_config("highlight", background="yellow", foreground="black")
+    text_box.see(line_number)
+
+    frame_index += 1
+    return flat_trace_artist, flat_pen_dot, flat_info, cyl_trace_artist, pen_world_artist, cyl_info
+
+def toggle_pause():
+    """Toggle pause/resume by stopping/starting the animation event_source."""
+    global is_paused, ani
+    if ani is None:
+        # nothing to pause/resume
+        return
+
+    if not is_paused:
+        # pause animation timer
+        try:
+            ani.event_source.stop()
+        except Exception:
+            pass
+        is_paused = True
+        pause_btn.config(text="Resume")
+    else:
+        # resume animation timer
+        try:
+            ani.event_source.start()
+        except Exception:
+            pass
+        is_paused = False
+        pause_btn.config(text="Pause")
+
+# Clear trace callback (button placed below)
+def clear_trace():
+    global x_local_marks, y_local_marks
+    x_local_marks = []
+    y_local_marks = []
+    flat_trace_artist.set_data([], [])
+    flat_pen_dot.set_data([], [])
+    cyl_trace_artist.set_data([], [])
+    cyl_trace_artist.set_3d_properties([])
+    canvas.draw()
+
+# ====== Buttons in GUI ======
+run_button = tk.Button(button_frame, text="Run Trajectory", command=run_trajectory)
+run_button.pack(side="left", padx=6)
+pause_btn = tk.Button(button_frame, text="Pause", command=toggle_pause)
+pause_btn.pack(side="left", padx=6)
+clear_btn = tk.Button(button_frame, text="Clear Trace", command=clear_trace)
+clear_btn.pack(side="left", padx=6)
+
+# ====== Start Tkinter mainloop ======
+root.mainloop()

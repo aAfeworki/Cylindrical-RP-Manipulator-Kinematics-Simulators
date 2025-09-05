@@ -1,0 +1,215 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.widgets import Slider, Button
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 for 3D projection
+
+# ----------------------
+# PARAMETERS
+# ----------------------
+R = 3.0            # fixed drum radius (no radius textbox per request)
+C = 2.0 * np.pi * R
+Y_MAX = 10.0       # vertical workspace size
+# initial slider values
+s_init = 1.0       # initial drum rotation expressed in arc-length units (s)
+y_init = 5.0       # initial pen vertical position
+
+# ----------------------
+# STORAGE (paper-local coordinates)
+# I store marks in local (unwrapped) coordinates:
+#   x_local = arc-length along paper (0..C)
+#   y_local = vertical
+# These local marks rotate in world coords according to current drum rotation s_current.
+# ----------------------
+x_local_marks = []  # arc-lengths where the pen has marked
+y_local_marks = []  # corresponding vertical positions
+
+# previous slider states (used for interpolation)
+prev_s = s_init
+prev_y = y_init
+
+# ----------------------
+# Utility: map local marks -> world xyz given rotation s_current
+# world theta = theta_local + phi  where phi = s_current / R
+# local theta = x_local / R
+# world X = R*cos(world_theta), Z = R*sin(world_theta), Y = y_local
+# ----------------------
+def marks_local_to_world(x_local_list, y_local_list, R, s_current):
+    if len(x_local_list) == 0:
+        return np.array([]), np.array([]), np.array([])
+    x_arr = np.array(x_local_list)
+    y_arr = np.array(y_local_list)
+    theta_local = x_arr / R
+    phi = s_current / R
+    theta_world = theta_local + phi
+    X = R * np.cos(theta_world)
+    Z = R * np.sin(theta_world)
+    Y = y_arr
+    return X, Y, Z
+
+# ----------------------
+# Build figure / axes / artists
+# ----------------------
+fig = plt.figure(figsize=(12, 6))
+ax_flat = fig.add_subplot(1, 2, 1)
+ax_cyl  = fig.add_subplot(1, 2, 2, projection='3d')
+plt.subplots_adjust(left=0.08, right=0.98, top=0.92, bottom=0.25)
+
+# Flat (unwrapped) workspace
+ax_flat.set_title("Flat Workspace (unwrapped)")
+ax_flat.set_xlabel("x (arc-length)")
+ax_flat.set_ylabel("y (horizontal)")
+ax_flat.set_xlim(0, C)
+ax_flat.set_ylim(0, Y_MAX)
+ax_flat.set_aspect('equal')
+ax_flat.plot([0, C, C, 0, 0], [0, 0, Y_MAX, Y_MAX, 0], 'k-', lw=2)  # rectangle outline
+flat_trace_line, = ax_flat.plot([], [], 'r-', lw=2)
+flat_pen_dot, = ax_flat.plot([], [], 'ro', markersize=6)            # show contact point in flat coords
+info_flat = ax_flat.text(0.02, 0.86, '', transform=ax_flat.transAxes,
+                         bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.8))
+
+# Cylinder view (wireframe once)
+ax_cyl.set_title("Cylindrical View (drum)")
+ax_cyl.set_xlabel("X")
+ax_cyl.set_ylabel("Y (horizontal)")
+ax_cyl.set_zlabel("Z")
+ax_cyl.set_ylim(0, Y_MAX)
+ax_cyl.set_xlim(-R - 1.0, R + 1.0)
+ax_cyl.set_zlim(-R - 1.0, R + 1.0)
+ax_cyl.view_init(elev=18, azim=-60)
+
+theta_grid = np.linspace(0, 2*np.pi, 120)
+y_grid = np.linspace(0, Y_MAX, 20)
+TH, YW = np.meshgrid(theta_grid, y_grid)
+XW = R * np.cos(TH)
+ZW = R * np.sin(TH)
+ax_cyl.plot_wireframe(XW, YW, ZW, rstride=2, cstride=4, linewidth=0.6, color='gray', alpha=0.45)
+ax_cyl.plot([0,0], [0, Y_MAX], [0,0], 'k-', lw=2)  # center axis reference
+
+# Pen: fixed in world coordinates (front of drum). We present it as stationary red dot in 3D.
+pen_world, = ax_cyl.plot([R], [y_init], [0], 'ro', markersize=7)
+
+# Cylinder trace artist
+cyl_trace_line, = ax_cyl.plot([], [], [], 'r-', lw=2)
+
+info_cyl = ax_cyl.text2D(0.02, 0.85, '', transform=ax_cyl.transAxes,
+                          bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.8))
+
+# ----------------------
+# Interpolated appending: avoid "shortcuts"
+# We will add many small intermediate marks along the change in (s,y),
+# so fast slider moves still produce continuous marks along the cylinder.
+# step_s: desired arc-length increment for interpolation (smaller => smoother trace)
+# step_y: desired vertical increment for interpolation
+# ----------------------
+def append_interpolated(prev_s, prev_y, new_s, new_y, R):
+    """Append intermediate marks between previous and new slider positions.
+       This makes the drawn path follow the cylinder surface even at high slider speed.
+    """
+    global x_local_marks, y_local_marks
+    ds = new_s - prev_s
+    dy = new_y - prev_y
+    # choose step sizes (empirical)
+    step_s = max(R * 0.005, C / 2000.0)  # approx small arc-length per interpolation step
+    step_y = max(0.01, Y_MAX / 1000.0)
+    n_s = int(np.ceil(abs(ds) / step_s)) if step_s > 0 else 0
+    n_y = int(np.ceil(abs(dy) / step_y)) if step_y > 0 else 0
+    n_steps = max(1, n_s, n_y)
+    # create intermediate samples (exclude starting point to avoid duplicates)
+    for k in range(1, n_steps + 1):
+        alpha = k / float(n_steps)
+        s_i = prev_s + alpha * ds
+        y_i = prev_y + alpha * dy
+        # local x on paper under the pen is (-s_i) mod C
+        x_local = (-s_i) % C
+        x_local_marks.append(x_local)
+        y_local_marks.append(y_i)
+
+# ----------------------
+# Clear trace
+# ----------------------
+def clear_trace(event=None):
+    global x_local_marks, y_local_marks
+    x_local_marks = []
+    y_local_marks = []
+    flat_trace_line.set_data([], [])
+    flat_pen_dot.set_data([], [])
+    cyl_trace_line.set_data([], [])
+    cyl_trace_line.set_3d_properties([])
+    fig.canvas.draw_idle()
+
+# ----------------------
+# Sliders & Button UI
+# ----------------------
+ax_s = plt.axes([0.12, 0.14, 0.68, 0.03], facecolor='lightgoldenrodyellow')
+ax_y = plt.axes([0.12, 0.09, 0.68, 0.03], facecolor='lightgoldenrodyellow')
+slider_s = Slider(ax_s, 'drum s (arc-length)', 0.0, C, valinit=s_init)
+slider_y = Slider(ax_y, 'pen y (horizontal)', 0.0, Y_MAX, valinit=y_init)
+
+ax_btn = plt.axes([0.84, 0.10, 0.12, 0.06])
+btn_clear = Button(ax_btn, 'Clear Trace', color='lightcoral', hovercolor='red')
+btn_clear.on_clicked(clear_trace)
+
+# ----------------------
+# Slider callback
+# ----------------------
+# prev_s and prev_y are mutated inside callback
+def on_slider_change(val):
+    global prev_s, prev_y, x_local_marks, y_local_marks
+    s_new = slider_s.val
+    y_new = slider_y.val
+
+    # append interpolated marks between prev and new positions (ensures no shortcuts)
+    append_interpolated(prev_s, prev_y, s_new, y_new, R)
+
+    # update prev
+    prev_s = s_new
+    prev_y = y_new
+
+    # visual update
+    update_display(s_new, y_new)
+
+slider_s.on_changed(on_slider_change)
+slider_y.on_changed(on_slider_change)
+
+# ----------------------
+# Display update: compute world coords of stored local marks using current s (rotation)
+# ----------------------
+def update_display(s_current, y_current):
+    # convert local marks -> world coords (rotation phi = s_current / R)
+    X, Y, Z = marks_local_to_world(x_local_marks, y_local_marks, R, s_current)
+    if X.size > 0:
+        cyl_trace_line.set_data(X, Y)
+        cyl_trace_line.set_3d_properties(Z)
+    else:
+        cyl_trace_line.set_data([], [])
+        cyl_trace_line.set_3d_properties([])
+
+    # flat (unwrapped) trace and pen contact indicator
+    if len(x_local_marks) > 0:
+        flat_trace_line.set_data(x_local_marks, y_local_marks)
+    else:
+        flat_trace_line.set_data([], [])
+    # current contact position on flat sheet (paper coordinate under pen)
+    x_contact = (-s_current) % C
+    flat_pen_dot.set_data([x_contact], [y_current])
+
+    # pen stays fixed in world coords at front of cylinder (X=R, Z=0)
+    pen_world.set_data([R], [y_current])
+    pen_world.set_3d_properties([0])
+
+    # info boxes
+    theta_local = x_contact / R
+    info_flat.set_text(f"x (arc) = {x_contact:.3f} / {C:.3f}\ny = {y_current:.3f}")
+    info_cyl.set_text(f"s (rotation) = {s_current:.3f}\nθ_front_local = {theta_local:.3f} rad\nR = {R:.3f}")
+
+    fig.canvas.draw_idle()
+
+# ----------------------
+# Initialize with initial values (no trace)
+# ----------------------
+prev_s = s_init
+prev_y = y_init
+update_display(s_init, y_init)
+
+plt.suptitle("Drum Plotter Simulator — Which is RP Robot")
+plt.show()
